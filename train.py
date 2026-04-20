@@ -176,11 +176,14 @@ def vec_2layer(X, y, C=0.1, hidden=64, n_iter=80, lr=0.005, seed=0):
 
 from scipy.optimize import minimize as scipy_minimize
 
-all_preds = []   # test predictions from each model
-all_val   = []   # val predictions (for OOF weight optimization)
+all_preds   = []   # test predictions from each model
+all_val     = []   # val predictions (for OOF weight optimization)
+model_cfgs  = []   # config dicts for two-pass retraining on full data
 
-# OOF split: 15% of training data for blend weight optimization
-VAL_FRAC = 0.15
+# OOF split: 5% of training data for blend weight optimization
+# (small holdout = more training data; weight estimation still stable
+#  because optimizer works over 205 × n_val scalar pairs per model)
+VAL_FRAC = 0.05
 np.random.seed(0)
 _perm      = np.random.permutation(len(X_tr_s))
 _n_val     = int(len(X_tr_s) * VAL_FRAC)
@@ -194,9 +197,10 @@ print(f"OOF split: {len(X_tr_oof)} train / {len(X_val_oof)} val")
 BUDGET = 260.0
 tr = lambda: BUDGET - (time.time() - t0)
 
-def _add(test_pv, val_pv):
+def _add(test_pv, val_pv, cfg=None):
     all_preds.append(full_pred(np.clip(test_pv, 0, 1).astype(np.float32)))
     all_val.append(full_pred(np.clip(val_pv,  0, 1).astype(np.float32)))
+    model_cfgs.append(cfg)  # None = can't retrain (nystroem/modality)
 
 # --- Ridge ---
 print("Ridge...")
@@ -204,7 +208,7 @@ for alpha in [30.0, 100.0, 500.0]:
     t1 = time.time()
     r = Ridge(alpha=alpha, fit_intercept=True)
     r.fit(X_tr_oof, y_tr_oof)
-    _add(r.predict(X_te_s), r.predict(X_val_oof))
+    _add(r.predict(X_te_s), r.predict(X_val_oof), {'type': 'ridge', 'alpha': alpha})
     print(f"  alpha={alpha}: {time.time()-t1:.1f}s")
 
 # --- Vectorized LogReg ensemble ---
@@ -213,9 +217,10 @@ for C in [0.03, 0.07, 0.15, 0.30, 0.60, 1.0, 2.0]:
     if tr() < 8:
         break
     t1 = time.time()
-    fn = vec_logreg(X_tr_oof, y_tr_oof, C=C, n_iter=60, lr=0.01)
-    _add(fn(X_te_s), fn(X_val_oof))
-    print(f"  C={C}: {time.time()-t1:.1f}s  total={time.time()-t0:.1f}s")
+    n_it = 100 if C >= 0.30 else 80  # weakly-regularized needs more iters
+    fn = vec_logreg(X_tr_oof, y_tr_oof, C=C, n_iter=n_it, lr=0.008)
+    _add(fn(X_te_s), fn(X_val_oof), {'type': 'logreg', 'C': C, 'n_iter': n_it, 'lr': 0.008})
+    print(f"  C={C} n={n_it}: {time.time()-t1:.1f}s  total={time.time()-t0:.1f}s")
 
 # --- Modality-specific LogReg (gene-only and cell-only SVD features) ---
 # svg components = cols 0:80, svc components = cols 80:120
@@ -253,19 +258,28 @@ if tr() > 90:
 else:
     print(f"Skipping Nystroem, {tr():.0f}s remain")
 
+# --- Modality-specific MLPs (gene-only / cell-only, fast) ---
+# svg=cols 0:100, svc=cols 100:150; these are fast because input dim << 315
+if tr() > 20:
+    print("Modality MLPs...")
+    for feat_slice, label in [
+        (slice(0, 100),  "gene"),
+        (slice(100, 150), "cell"),
+    ]:
+        for seed in range(3):
+            if tr() < 10:
+                break
+            t1 = time.time()
+            fn = vec_2layer(X_tr_oof[:, feat_slice], y_tr_oof, C=0.10, hidden=64,
+                            n_iter=80, lr=0.005, seed=seed)
+            _add(fn(X_te_s[:, feat_slice]), fn(X_val_oof[:, feat_slice]))
+            print(f"  MLP-{label} s={seed}: {time.time()-t1:.1f}s  total={time.time()-t0:.1f}s")
+
 # --- Vectorized 2-layer MLP ensemble ---
 print("2-layer MLP ensemble...")
 mlp2_configs = [
-    # h=128 first (diverse capacity without h=256 slowness on large features)
-    (0,  128, 50, 0.003, 0.10),
-    (1,  128, 50, 0.003, 0.10),
-    (2,  128, 50, 0.003, 0.10),
-    (3,  128, 50, 0.003, 0.10),
-    (4,  128, 50, 0.003, 0.10),
-    (0,  128, 50, 0.003, 0.20),
-    (1,  128, 50, 0.003, 0.20),
-    (2,  128, 50, 0.003, 0.20),
-    # h=64 high-count for variance reduction
+    # h=64 first: fast models run even on loaded systems; h=128 appended at end
+    # so budget guard gracefully skips h=128 when system is slow
     (0,  64,  60, 0.005, 0.10),
     (1,  64,  60, 0.005, 0.10),
     (2,  64,  60, 0.005, 0.10),
@@ -282,10 +296,43 @@ mlp2_configs = [
     (3,  64,  60, 0.005, 0.20),
     (4,  64,  60, 0.005, 0.20),
     (5,  64,  60, 0.005, 0.20),
+    # h=64 80-iter: better convergence, still fast
     (0,  64,  80, 0.003, 0.10),
     (1,  64,  80, 0.003, 0.10),
     (2,  64,  80, 0.003, 0.10),
     (3,  64,  80, 0.003, 0.10),
+    # h=128: higher capacity, only runs when budget permits
+    (0,  128, 50, 0.003, 0.10),
+    (1,  128, 50, 0.003, 0.10),
+    (2,  128, 50, 0.003, 0.10),
+    (3,  128, 50, 0.003, 0.10),
+    (4,  128, 50, 0.003, 0.10),
+    (0,  128, 50, 0.003, 0.20),
+    (1,  128, 50, 0.003, 0.20),
+    (2,  128, 50, 0.003, 0.20),
+    # h=256: highest capacity (chanbin's 'wider MLPs'); ~2-15s each depending
+    # on system load; only runs when budget permits (>65s remaining)
+    (0,  256, 35, 0.003, 0.10),
+    (1,  256, 35, 0.003, 0.10),
+    (2,  256, 35, 0.003, 0.10),
+    (3,  256, 35, 0.003, 0.10),
+    (4,  256, 35, 0.003, 0.10),
+    (5,  256, 35, 0.003, 0.10),
+    (6,  256, 35, 0.003, 0.10),
+    (0,  256, 35, 0.003, 0.20),
+    (1,  256, 35, 0.003, 0.20),
+    (2,  256, 35, 0.003, 0.20),
+    (3,  256, 35, 0.003, 0.20),
+    # h=256 more iters: better convergence for the wider network
+    (0,  256, 60, 0.002, 0.10),
+    (1,  256, 60, 0.002, 0.10),
+    (2,  256, 60, 0.002, 0.10),
+    (0,  256, 60, 0.002, 0.20),
+    (1,  256, 60, 0.002, 0.20),
+    # h=256 strong regularization: helps with 99.7% sparse targets
+    (0,  256, 50, 0.003, 0.05),
+    (1,  256, 50, 0.003, 0.05),
+    (2,  256, 50, 0.003, 0.05),
 ]
 for seed, hidden, n_iter, lr, C in mlp2_configs:
     remaining = tr()
@@ -298,7 +345,8 @@ for seed, hidden, n_iter, lr, C in mlp2_configs:
     print(f"  2L h={hidden} s={seed} C={C}  t={time.time()-t0:.1f}s ...")
     fn = vec_2layer(X_tr_oof, y_tr_oof, C=C, hidden=hidden,
                     n_iter=n_iter, lr=lr, seed=seed)
-    _add(np.clip(fn(X_te_s), 0, 1), np.clip(fn(X_val_oof), 0, 1))
+    _add(np.clip(fn(X_te_s), 0, 1), np.clip(fn(X_val_oof), 0, 1),
+         {'type': 'mlp', 'hidden': hidden, 'n_iter': n_iter, 'lr': lr, 'C': C, 'seed': seed})
     print(f"    {time.time()-t1:.1f}s  total={time.time()-t0:.1f}s")
 
 # === OOF weight optimization ===
@@ -329,6 +377,40 @@ print(f"  OOF val loss: {res.fun:.6f}  ({time.time()-t_opt:.1f}s)")
 print(f"  Weights: min={opt_w.min():.4f}  max={opt_w.max():.4f}")
 all_weights = opt_w.tolist()
 
+# === Two-pass: retrain top models on full training data ===
+# Using X_tr_s (100% data) vs X_tr_oof (95%) gives ~5% more samples,
+# improving test predictions while keeping OOF-optimized weights.
+if tr() > 20:
+    _top_k = min(25, n_m)
+    _top_idx = np.argsort(opt_w)[-_top_k:][::-1]  # highest weight first
+    _retrained = 0
+    print(f"Two-pass: retraining up to {_top_k} top models on full data...")
+    for mi in _top_idx:
+        if tr() < 12:
+            break
+        cfg = model_cfgs[mi]
+        if cfg is None:
+            continue  # nystroem / modality — skip
+        t1 = time.time()
+        if cfg['type'] == 'ridge':
+            r2 = Ridge(alpha=cfg['alpha'], fit_intercept=True)
+            r2.fit(X_tr_s, ytr_v)
+            new_p = full_pred(np.clip(r2.predict(X_te_s), 0, 1)).astype(np.float64)
+        elif cfg['type'] == 'logreg':
+            fn2 = vec_logreg(X_tr_s, ytr_v, C=cfg['C'], n_iter=cfg['n_iter'], lr=cfg['lr'])
+            new_p = full_pred(np.clip(fn2(X_te_s), 0, 1)).astype(np.float64)
+        elif cfg['type'] == 'mlp':
+            fn2 = vec_2layer(X_tr_s, ytr_v, C=cfg['C'], hidden=cfg['hidden'],
+                             n_iter=cfg['n_iter'], lr=cfg['lr'], seed=cfg['seed'])
+            new_p = full_pred(np.clip(fn2(X_te_s), 0, 1)).astype(np.float64)
+        else:
+            continue
+        test_stack[mi] = new_p
+        _retrained += 1
+        print(f"  Retrained #{_retrained} (idx={mi}, {cfg['type']}, w={opt_w[mi]:.4f}): "
+              f"{time.time()-t1:.1f}s  t={time.time()-t0:.1f}s")
+    print(f"  Two-pass done: {_retrained} models retrained on full data")
+
 # === Weighted ensemble (OOF-optimized weights) ===
 print(f"Ensembling {len(all_preds)} models...")
 w = np.array(all_weights, dtype=np.float32)
@@ -336,15 +418,44 @@ w /= w.sum()
 ensemble = np.einsum('m,mjt->jt', w.astype(np.float64), test_stack).astype(np.float32)
 ensemble = np.clip(ensemble, 1e-6, 1 - 1e-6)
 
-# === Per-target adaptive Bayesian calibration ===
-print("Calibrating...")
+# === Per-target Platt scaling + Bayesian fallback ===
+# For targets with ≥8 positives in OOF val: fit σ,δ on val predictions
+# via L-BFGS-B to directly optimize log loss per target.
+# Rare targets (< 8 positives in val) fall back to Bayesian shrinkage.
+print("Calibrating (Platt + Bayesian fallback)...")
+val_ens = np.einsum('m,mjt->jt', opt_w.astype(np.float64), val_stack).astype(np.float64)
+val_ens = np.clip(val_ens, 1e-6, 1 - 1e-6)
+val_logit = np.log(val_ens / (1 - val_ens))  # (n_val, n_tar)
+ens_logit = np.log(np.clip(ensemble, 1e-6, 1-1e-6).astype(np.float64) /
+                   (1 - np.clip(ensemble, 1e-6, 1-1e-6).astype(np.float64)))
+
+PLATT_MIN_POS = 8
+_platt_n = 0
 for j in range(n_tar):
     br = float(base_rates[j])
-    alpha = 0.10 if br < 0.001 else 0.07 if br < 0.003 else \
-            0.05 if br < 0.007 else 0.03 if br < 0.02 else 0.01
-    ensemble[:, j] = (1.0 - alpha) * ensemble[:, j] + alpha * br
+    n_pos = int(y_val_full[:, j].sum())
+    if n_pos >= PLATT_MIN_POS:
+        lp = val_logit[:, j]
+        yj = y_val_full[:, j]
+        def _obj(p, _lp=lp, _y=yj):
+            s, d = p
+            q = 1 / (1 + np.exp(-np.clip(s * _lp + d, -50, 50)))
+            return -((_y * np.log(q+1e-9) + (1-_y) * np.log(1-q+1e-9))).mean() \
+                   + 0.05 * (s-1)**2 + 0.05 * d**2
+        rj = scipy_minimize(_obj, [1.0, 0.0], method='L-BFGS-B',
+                            options={'maxiter': 100})
+        s_j, d_j = rj.x
+        ensemble[:, j] = np.clip(
+            1 / (1 + np.exp(-np.clip(s_j * ens_logit[:, j] + d_j, -50, 50))),
+            1e-6, 1-1e-6)
+        _platt_n += 1
+    else:
+        alpha = 0.10 if br < 0.001 else 0.07 if br < 0.003 else \
+                0.05 if br < 0.007 else 0.03 if br < 0.02 else 0.01
+        ensemble[:, j] = (1.0 - alpha) * ensemble[:, j] + alpha * br
+print(f"  Platt: {_platt_n}/{n_tar}  Bayesian: {n_tar-_platt_n}/{n_tar}")
 
-ensemble = np.clip(ensemble, 1e-6, 1 - 1e-6)
+ensemble = np.clip(ensemble.astype(np.float32), 1e-6, 1 - 1e-6)
 
 # === Build submission ===
 submission = pd.DataFrame(
