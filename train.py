@@ -381,7 +381,7 @@ all_weights = opt_w.tolist()
 # Using X_tr_s (100% data) vs X_tr_oof (95%) gives ~5% more samples,
 # improving test predictions while keeping OOF-optimized weights.
 if tr() > 20:
-    _top_k = min(25, n_m)
+    _top_k = min(40, n_m)
     _top_idx = np.argsort(opt_w)[-_top_k:][::-1]  # highest weight first
     _retrained = 0
     print(f"Two-pass: retraining up to {_top_k} top models on full data...")
@@ -441,7 +441,7 @@ for j in range(n_tar):
             s, d = p
             q = 1 / (1 + np.exp(-np.clip(s * _lp + d, -50, 50)))
             return -((_y * np.log(q+1e-9) + (1-_y) * np.log(1-q+1e-9))).mean() \
-                   + 0.05 * (s-1)**2 + 0.05 * d**2
+                   + 0.10 * (s-1)**2 + 0.10 * d**2
         rj = scipy_minimize(_obj, [1.0, 0.0], method='L-BFGS-B',
                             options={'maxiter': 100})
         s_j, d_j = rj.x
