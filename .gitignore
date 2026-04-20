@@ -6,3 +6,5 @@ __pycache__/
 # Raw Kaggle downloads (not needed after split)
 train_features.csv
 train_targets_scored.csv
+.hive/
+data/
