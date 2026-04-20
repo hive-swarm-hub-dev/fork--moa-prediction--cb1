@@ -68,15 +68,22 @@ def build_features(train_df, test_df):
     ag  = StandardScaler().fit_transform(all_g)
     ac  = StandardScaler().fit_transform(all_c)
     agc = StandardScaler().fit_transform(all_gc)
-    svg  = TruncatedSVD(100, n_iter=1, random_state=0).fit_transform(ag)
-    svc  = TruncatedSVD(50, n_iter=1, random_state=0).fit_transform(ac)
-    svgc = TruncatedSVD(40, n_iter=1, random_state=0).fit_transform(agc)
+    svg  = TruncatedSVD(100, n_iter=4, random_state=0).fit_transform(ag)
+    svc  = TruncatedSVD(50, n_iter=4, random_state=0).fit_transform(ac)
+    svgc = TruncatedSVD(40, n_iter=2, random_state=0).fit_transform(agc)
     # Cross-PCA: SVD on gene×cell outer products captures interaction manifold
     n_all = len(all_g)
     cross_flat = (svg[:, :25, None] * svc[:, None, :20]).reshape(n_all, -1)
-    cross_pca = TruncatedSVD(25, n_iter=1, random_state=0).fit_transform(cross_flat)
+    cross_pca = TruncatedSVD(25, n_iter=2, random_state=0).fit_transform(cross_flat)
     cp_t = np.concatenate([train_df["cp_t"].values, test_df["cp_t"].values])
     cp_d = np.concatenate([train_df["cp_d"].values, test_df["cp_d"].values])
+    # Nystroem RBF on 50-dim PCA subspace (transductive: fit on train+test combined)
+    # gamma=0.03 calibrated for 50-dim space; higher gamma makes kernel near-zero
+    X_low = np.hstack([svg[:, :35], svc[:, :15]]).astype(np.float32)
+    X_low = StandardScaler().fit_transform(X_low)
+    nys = Nystroem(kernel='rbf', n_components=300, gamma=0.03, random_state=42)
+    nys.fit(X_low)
+    X_nys = nys.transform(X_low).astype(np.float32)
     X = np.hstack([
         svg, svc, svgc,
         svg[:, :25] * cp_t[:, None], svg[:, :25] * cp_d[:, None],
@@ -85,6 +92,7 @@ def build_features(train_df, test_df):
         cross_pca,
         stat_block(all_g), stat_block(all_c),
         np.column_stack([cp_t, cp_d, cp_t * cp_d, cp_t ** 2]),
+        X_nys,  # 300 Nystroem RBF features (cols 315:615)
     ]).astype(np.float32)
     return X[:n_tr], X[n_tr:]
 
@@ -183,7 +191,7 @@ model_cfgs  = []   # config dicts for two-pass retraining on full data
 # OOF split: 5% of training data for blend weight optimization
 # (small holdout = more training data; weight estimation still stable
 #  because optimizer works over 205 × n_val scalar pairs per model)
-VAL_FRAC = 0.05
+VAL_FRAC = 0.10
 np.random.seed(0)
 _perm      = np.random.permutation(len(X_tr_s))
 _n_val     = int(len(X_tr_s) * VAL_FRAC)
@@ -213,21 +221,22 @@ for alpha in [30.0, 100.0, 500.0]:
 
 # --- Vectorized LogReg ensemble ---
 print("LogReg ensemble...")
-for C in [0.03, 0.07, 0.15, 0.30, 0.60, 1.0, 2.0]:
+for C in [0.03, 0.05, 0.07, 0.10, 0.13, 0.18, 0.25]:
     if tr() < 8:
         break
     t1 = time.time()
-    n_it = 100 if C >= 0.30 else 80  # weakly-regularized needs more iters
+    n_it = 80
     fn = vec_logreg(X_tr_oof, y_tr_oof, C=C, n_iter=n_it, lr=0.008)
-    _add(fn(X_te_s), fn(X_val_oof), {'type': 'logreg', 'C': C, 'n_iter': n_it, 'lr': 0.008})
+    _add(fn(X_te_s), fn(X_val_oof), {'type': 'logreg', 'C': C, 'n_iter': n_it, 'lr': 0.008})  # noqa: E501
     print(f"  C={C} n={n_it}: {time.time()-t1:.1f}s  total={time.time()-t0:.1f}s")
 
 # --- Modality-specific LogReg (gene-only and cell-only SVD features) ---
-# svg components = cols 0:80, svc components = cols 80:120
+# svg components = cols 0:100, svc components = cols 100:150
 print("Modality LogReg...")
-for X_mod, label in [(X_tr_oof[:, :80], "gene"), (X_tr_oof[:, 80:120], "cell")]:
-    X_mod_val = X_val_oof[:, :80] if label == "gene" else X_val_oof[:, 80:120]
-    X_mod_te  = X_te_s[:, :80] if label == "gene" else X_te_s[:, 80:120]
+for feat_start, feat_end, label in [(0, 100, "gene"), (100, 150, "cell")]:
+    X_mod     = X_tr_oof[:, feat_start:feat_end]
+    X_mod_val = X_val_oof[:, feat_start:feat_end]
+    X_mod_te  = X_te_s[:, feat_start:feat_end]
     for C in [0.1, 0.5]:
         if tr() < 15:
             print(f"  Skipping {label} C={C}, {tr():.0f}s remain")
@@ -237,26 +246,6 @@ for X_mod, label in [(X_tr_oof[:, :80], "gene"), (X_tr_oof[:, 80:120], "cell")]:
         _add(fn(X_mod_te), fn(X_mod_val))
         print(f"  {label} C={C}: {time.time()-t1:.1f}s  total={time.time()-t0:.1f}s")
 
-# --- Nystroem RBF kernel + LogReg ---
-if tr() > 90:
-    print("Nystroem + LogReg...")
-    t1 = time.time()
-    ny = Nystroem(kernel='rbf', n_components=150, random_state=0)
-    ny.fit(X_tr_oof)
-    sc_ny = StandardScaler()
-    X_tr_ny  = sc_ny.fit_transform(ny.transform(X_tr_oof).astype(np.float32))
-    X_val_ny = sc_ny.transform(ny.transform(X_val_oof).astype(np.float32))
-    X_te_ny  = sc_ny.transform(ny.transform(X_te_s).astype(np.float32))
-    print(f"  Nystroem transform: {time.time()-t1:.1f}s")
-    for C in [0.1, 0.3, 0.7]:
-        if tr() < 12:
-            break
-        t1 = time.time()
-        fn = vec_logreg(X_tr_ny, y_tr_oof, C=C, n_iter=40, lr=0.01)
-        _add(fn(X_te_ny), fn(X_val_ny))
-        print(f"  Ny+LR C={C}: {time.time()-t1:.1f}s  total={time.time()-t0:.1f}s")
-else:
-    print(f"Skipping Nystroem, {tr():.0f}s remain")
 
 # --- Modality-specific MLPs (gene-only / cell-only, fast) ---
 # svg=cols 0:100, svc=cols 100:150; these are fast because input dim << 315
@@ -276,63 +265,64 @@ if tr() > 20:
             print(f"  MLP-{label} s={seed}: {time.time()-t1:.1f}s  total={time.time()-t0:.1f}s")
 
 # --- Vectorized 2-layer MLP ensemble ---
+# With 615-dim features (vs 315 before), each model is ~2x slower (~5s each).
+# Reduced config count to fit within 260s budget while maximizing diversity.
 print("2-layer MLP ensemble...")
 mlp2_configs = [
-    # h=64 first: fast models run even on loaded systems; h=128 appended at end
-    # so budget guard gracefully skips h=128 when system is slow
-    (0,  64,  60, 0.005, 0.10),
-    (1,  64,  60, 0.005, 0.10),
-    (2,  64,  60, 0.005, 0.10),
-    (3,  64,  60, 0.005, 0.10),
-    (4,  64,  60, 0.005, 0.10),
-    (5,  64,  60, 0.005, 0.10),
-    (6,  64,  60, 0.005, 0.10),
-    (7,  64,  60, 0.005, 0.10),
-    (8,  64,  60, 0.005, 0.10),
-    (9,  64,  60, 0.005, 0.10),
-    (0,  64,  60, 0.005, 0.20),
-    (1,  64,  60, 0.005, 0.20),
-    (2,  64,  60, 0.005, 0.20),
-    (3,  64,  60, 0.005, 0.20),
-    (4,  64,  60, 0.005, 0.20),
-    (5,  64,  60, 0.005, 0.20),
-    # h=64 80-iter: better convergence, still fast
-    (0,  64,  80, 0.003, 0.10),
-    (1,  64,  80, 0.003, 0.10),
-    (2,  64,  80, 0.003, 0.10),
-    (3,  64,  80, 0.003, 0.10),
-    # h=128: higher capacity, only runs when budget permits
-    (0,  128, 50, 0.003, 0.10),
-    (1,  128, 50, 0.003, 0.10),
-    (2,  128, 50, 0.003, 0.10),
-    (3,  128, 50, 0.003, 0.10),
-    (4,  128, 50, 0.003, 0.10),
-    (0,  128, 50, 0.003, 0.20),
-    (1,  128, 50, 0.003, 0.20),
-    (2,  128, 50, 0.003, 0.20),
-    # h=256: highest capacity (chanbin's 'wider MLPs'); ~2-15s each depending
-    # on system load; only runs when budget permits (>65s remaining)
-    (0,  256, 35, 0.003, 0.10),
-    (1,  256, 35, 0.003, 0.10),
-    (2,  256, 35, 0.003, 0.10),
-    (3,  256, 35, 0.003, 0.10),
-    (4,  256, 35, 0.003, 0.10),
-    (5,  256, 35, 0.003, 0.10),
-    (6,  256, 35, 0.003, 0.10),
-    (0,  256, 35, 0.003, 0.20),
-    (1,  256, 35, 0.003, 0.20),
-    (2,  256, 35, 0.003, 0.20),
-    (3,  256, 35, 0.003, 0.20),
-    # h=256 more iters: better convergence for the wider network
-    (0,  256, 60, 0.002, 0.10),
-    (1,  256, 60, 0.002, 0.10),
-    (2,  256, 60, 0.002, 0.10),
-    (0,  256, 60, 0.002, 0.20),
-    (1,  256, 60, 0.002, 0.20),
-    # h=256 strong regularization: helps with 99.7% sparse targets
-    (0,  256, 50, 0.003, 0.05),
-    (1,  256, 50, 0.003, 0.05),
-    (2,  256, 50, 0.003, 0.05),
+    # h=64 first: fast, guaranteed to run even under load (~2.7s each)
+    (0,  64,  80, 0.005, 0.10),
+    (1,  64,  80, 0.005, 0.10),
+    (2,  64,  80, 0.005, 0.10),
+    (3,  64,  80, 0.005, 0.10),
+    (4,  64,  80, 0.005, 0.10),
+    (5,  64,  80, 0.005, 0.10),
+    (6,  64,  80, 0.005, 0.10),
+    (7,  64,  80, 0.005, 0.10),
+    (8,  64,  80, 0.005, 0.10),
+    (9,  64,  80, 0.005, 0.10),
+    (10, 64,  80, 0.005, 0.10),
+    (0,  64,  80, 0.005, 0.20),
+    (1,  64,  80, 0.005, 0.20),
+    (2,  64,  80, 0.005, 0.20),
+    (3,  64,  80, 0.005, 0.20),
+    (4,  64,  80, 0.005, 0.20),
+    (5,  64,  80, 0.005, 0.20),
+    (6,  64,  80, 0.005, 0.20),
+    (7,  64,  80, 0.005, 0.20),
+    # h=64 low-C: strong regularization for sparse targets
+    (0,  64,  80, 0.005, 0.05),
+    (1,  64,  80, 0.005, 0.05),
+    (2,  64,  80, 0.005, 0.05),
+    (3,  64,  80, 0.005, 0.05),
+    # h=128: higher capacity, skip if < 50s remain (~3s each)
+    (0,  128, 60, 0.003, 0.10),
+    (1,  128, 60, 0.003, 0.10),
+    (2,  128, 60, 0.003, 0.10),
+    (3,  128, 60, 0.003, 0.10),
+    (4,  128, 60, 0.003, 0.10),
+    (5,  128, 60, 0.003, 0.10),
+    (6,  128, 60, 0.003, 0.10),
+    (7,  128, 60, 0.003, 0.10),
+    (0,  128, 60, 0.003, 0.20),
+    (1,  128, 60, 0.003, 0.20),
+    (2,  128, 60, 0.003, 0.20),
+    (3,  128, 60, 0.003, 0.20),
+    (0,  128, 60, 0.003, 0.05),
+    (1,  128, 60, 0.003, 0.05),
+    (2,  128, 60, 0.003, 0.05),
+    # h=256: widest network, skip if < 65s remain (~3-4s each)
+    (0,  256, 40, 0.002, 0.10),
+    (1,  256, 40, 0.002, 0.10),
+    (2,  256, 40, 0.002, 0.10),
+    (3,  256, 40, 0.002, 0.10),
+    (4,  256, 40, 0.002, 0.10),
+    (0,  256, 40, 0.002, 0.20),
+    (1,  256, 40, 0.002, 0.20),
+    (2,  256, 40, 0.002, 0.20),
+    (3,  256, 40, 0.002, 0.20),
+    (0,  256, 40, 0.002, 0.05),
+    (1,  256, 40, 0.002, 0.05),
+    (2,  256, 40, 0.002, 0.05),
 ]
 for seed, hidden, n_iter, lr, C in mlp2_configs:
     remaining = tr()
@@ -381,7 +371,7 @@ all_weights = opt_w.tolist()
 # Using X_tr_s (100% data) vs X_tr_oof (95%) gives ~5% more samples,
 # improving test predictions while keeping OOF-optimized weights.
 if tr() > 20:
-    _top_k = min(40, n_m)
+    _top_k = min(25, n_m)
     _top_idx = np.argsort(opt_w)[-_top_k:][::-1]  # highest weight first
     _retrained = 0
     print(f"Two-pass: retraining up to {_top_k} top models on full data...")
