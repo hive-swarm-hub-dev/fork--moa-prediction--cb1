@@ -2,13 +2,17 @@
 Building on chanbin-test-moa/af3682d5 (-0.01539)
 Design:
   - TruncatedSVD n_iter=1 (fast: ~18s vs 138s for PCA default)
-  - Stat features + combined SVD
+  - Stat features + combined SVD + cross-PCA
   - vec_logreg n_iter=60: fast convergence via warm bias init (logit of base rate)
   - Nystroem RBF kernel for non-linearity
   - vec_2layer: vectorized 2-layer MLP with warm bias, He init, Adam
     avoids sklearn MLPClassifier slowness on 99.7% sparse multi-label data
   - Per-target adaptive Bayesian calibration
 """
+import os
+os.environ['OMP_NUM_THREADS'] = '4'
+os.environ['OPENBLAS_NUM_THREADS'] = '4'
+os.environ['MKL_NUM_THREADS'] = '4'
 import pandas as pd
 import numpy as np
 from sklearn.decomposition import TruncatedSVD
@@ -67,6 +71,10 @@ def build_features(train_df, test_df):
     svg  = TruncatedSVD(80, n_iter=1, random_state=0).fit_transform(ag)
     svc  = TruncatedSVD(40, n_iter=1, random_state=0).fit_transform(ac)
     svgc = TruncatedSVD(30, n_iter=1, random_state=0).fit_transform(agc)
+    # Cross-PCA: SVD on gene×cell outer products captures interaction manifold
+    n_all = len(all_g)
+    cross_flat = (svg[:, :20, None] * svc[:, None, :15]).reshape(n_all, -1)
+    cross_pca = TruncatedSVD(20, n_iter=1, random_state=0).fit_transform(cross_flat)
     cp_t = np.concatenate([train_df["cp_t"].values, test_df["cp_t"].values])
     cp_d = np.concatenate([train_df["cp_d"].values, test_df["cp_d"].values])
     X = np.hstack([
@@ -74,6 +82,7 @@ def build_features(train_df, test_df):
         svg[:, :20] * cp_t[:, None], svg[:, :20] * cp_d[:, None],
         svc[:, :10] * cp_t[:, None], svc[:, :10] * cp_d[:, None],
         svg[:, :8] * svc[:, :8],
+        cross_pca,
         stat_block(all_g), stat_block(all_c),
         np.column_stack([cp_t, cp_d, cp_t * cp_d, cp_t ** 2]),
     ]).astype(np.float32)
@@ -210,7 +219,7 @@ if tr() > 90:
         if tr() < 12:
             break
         t1 = time.time()
-        fn = vec_logreg(X_tr_ny, ytr_v, C=C, n_iter=60, lr=0.01)
+        fn = vec_logreg(X_tr_ny, ytr_v, C=C, n_iter=40, lr=0.01)
         pv = fn(X_te_ny)
         all_preds.append(full_pred(pv)); all_weights.append(0.8)
         print(f"  Ny+LR C={C}: {time.time()-t1:.1f}s  total={time.time()-t0:.1f}s")
@@ -224,8 +233,10 @@ print("2-layer MLP ensemble...")
 mlp2_configs = [
     (0,  64,  60, 0.005, 0.10),
     (0,  128, 50, 0.003, 0.10),
+    (0,  256, 35, 0.002, 0.10),
     (1,  64,  60, 0.005, 0.10),
     (1,  128, 50, 0.003, 0.10),
+    (1,  256, 35, 0.002, 0.10),
     (2,  64,  60, 0.005, 0.10),
     (3,  64,  60, 0.005, 0.10),
     (0,  64,  60, 0.005, 0.20),
@@ -237,11 +248,14 @@ mlp2_configs = [
 ]
 for seed, hidden, n_iter, lr, C in mlp2_configs:
     remaining = tr()
-    if remaining < 21:
+    if remaining < 23:
         print(f"  Stopping, {remaining:.0f}s remain")
         break
-    if hidden == 128 and remaining < 38:
-        print(f"  Skipping h=128 s={seed} C={C}, {remaining:.0f}s remain")
+    if hidden >= 256 and remaining < 65:
+        print(f"  Skipping h={hidden} s={seed} C={C}, {remaining:.0f}s remain")
+        continue
+    if hidden >= 128 and remaining < 42:
+        print(f"  Skipping h={hidden} s={seed} C={C}, {remaining:.0f}s remain")
         continue
     t1 = time.time()
     print(f"  2L h={hidden} s={seed} C={C}  t={time.time()-t0:.1f}s ...")
