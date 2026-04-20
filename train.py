@@ -68,20 +68,20 @@ def build_features(train_df, test_df):
     ag  = StandardScaler().fit_transform(all_g)
     ac  = StandardScaler().fit_transform(all_c)
     agc = StandardScaler().fit_transform(all_gc)
-    svg  = TruncatedSVD(80, n_iter=1, random_state=0).fit_transform(ag)
-    svc  = TruncatedSVD(40, n_iter=1, random_state=0).fit_transform(ac)
-    svgc = TruncatedSVD(30, n_iter=1, random_state=0).fit_transform(agc)
+    svg  = TruncatedSVD(100, n_iter=1, random_state=0).fit_transform(ag)
+    svc  = TruncatedSVD(50, n_iter=1, random_state=0).fit_transform(ac)
+    svgc = TruncatedSVD(40, n_iter=1, random_state=0).fit_transform(agc)
     # Cross-PCA: SVD on gene×cell outer products captures interaction manifold
     n_all = len(all_g)
-    cross_flat = (svg[:, :20, None] * svc[:, None, :15]).reshape(n_all, -1)
-    cross_pca = TruncatedSVD(20, n_iter=1, random_state=0).fit_transform(cross_flat)
+    cross_flat = (svg[:, :25, None] * svc[:, None, :20]).reshape(n_all, -1)
+    cross_pca = TruncatedSVD(25, n_iter=1, random_state=0).fit_transform(cross_flat)
     cp_t = np.concatenate([train_df["cp_t"].values, test_df["cp_t"].values])
     cp_d = np.concatenate([train_df["cp_d"].values, test_df["cp_d"].values])
     X = np.hstack([
         svg, svc, svgc,
-        svg[:, :20] * cp_t[:, None], svg[:, :20] * cp_d[:, None],
-        svc[:, :10] * cp_t[:, None], svc[:, :10] * cp_d[:, None],
-        svg[:, :8] * svc[:, :8],
+        svg[:, :25] * cp_t[:, None], svg[:, :25] * cp_d[:, None],
+        svc[:, :12] * cp_t[:, None], svc[:, :12] * cp_d[:, None],
+        svg[:, :10] * svc[:, :10],
         cross_pca,
         stat_block(all_g), stat_block(all_c),
         np.column_stack([cp_t, cp_d, cp_t * cp_d, cp_t ** 2]),
@@ -174,74 +174,97 @@ def vec_2layer(X, y, C=0.1, hidden=64, n_iter=80, lr=0.005, seed=0):
     return predict
 
 
-all_preds   = []
-all_weights = []
+from scipy.optimize import minimize as scipy_minimize
 
-# Budget: leave 27s for ensemble/write/python-exit
-BUDGET = 273.0
+all_preds = []   # test predictions from each model
+all_val   = []   # val predictions (for OOF weight optimization)
+
+# OOF split: 15% of training data for blend weight optimization
+VAL_FRAC = 0.15
+np.random.seed(0)
+_perm      = np.random.permutation(len(X_tr_s))
+_n_val     = int(len(X_tr_s) * VAL_FRAC)
+_val_idx   = _perm[:_n_val]
+_tr_idx    = _perm[_n_val:]
+X_tr_oof   = X_tr_s[_tr_idx];    X_val_oof  = X_tr_s[_val_idx]
+y_tr_oof   = ytr_v[_tr_idx];     y_val_oof  = ytr_v[_val_idx]
+print(f"OOF split: {len(X_tr_oof)} train / {len(X_val_oof)} val")
+
+# Budget: reserve 40s for OOF weight opt + ensemble/write
+BUDGET = 260.0
 tr = lambda: BUDGET - (time.time() - t0)
 
-# --- Ridge (multi-output, closed-form) ---
+def _add(test_pv, val_pv):
+    all_preds.append(full_pred(np.clip(test_pv, 0, 1).astype(np.float32)))
+    all_val.append(full_pred(np.clip(val_pv,  0, 1).astype(np.float32)))
+
+# --- Ridge ---
 print("Ridge...")
 for alpha in [30.0, 100.0, 500.0]:
     t1 = time.time()
     r = Ridge(alpha=alpha, fit_intercept=True)
-    r.fit(X_tr_s, ytr_v)
-    pv = np.clip(r.predict(X_te_s), 0.0, 1.0).astype(np.float32)
-    all_preds.append(full_pred(pv)); all_weights.append(0.3)
+    r.fit(X_tr_oof, y_tr_oof)
+    _add(r.predict(X_te_s), r.predict(X_val_oof))
     print(f"  alpha={alpha}: {time.time()-t1:.1f}s")
 
-# --- Vectorized LogReg ensemble (warm-init, 60 iters) ---
+# --- Vectorized LogReg ensemble ---
 print("LogReg ensemble...")
 for C in [0.03, 0.07, 0.15, 0.30, 0.60, 1.0, 2.0]:
     if tr() < 8:
-        print(f"  Skipping C={C}, {tr():.0f}s remain")
         break
     t1 = time.time()
-    fn = vec_logreg(X_tr_s, ytr_v, C=C, n_iter=60, lr=0.01)
-    pv = fn(X_te_s)
-    all_preds.append(full_pred(pv)); all_weights.append(0.6)
+    fn = vec_logreg(X_tr_oof, y_tr_oof, C=C, n_iter=60, lr=0.01)
+    _add(fn(X_te_s), fn(X_val_oof))
     print(f"  C={C}: {time.time()-t1:.1f}s  total={time.time()-t0:.1f}s")
 
+# --- Modality-specific LogReg (gene-only and cell-only SVD features) ---
+# svg components = cols 0:80, svc components = cols 80:120
+print("Modality LogReg...")
+for X_mod, label in [(X_tr_oof[:, :80], "gene"), (X_tr_oof[:, 80:120], "cell")]:
+    X_mod_val = X_val_oof[:, :80] if label == "gene" else X_val_oof[:, 80:120]
+    X_mod_te  = X_te_s[:, :80] if label == "gene" else X_te_s[:, 80:120]
+    for C in [0.1, 0.5]:
+        if tr() < 15:
+            print(f"  Skipping {label} C={C}, {tr():.0f}s remain")
+            break
+        t1 = time.time()
+        fn = vec_logreg(X_mod, y_tr_oof, C=C, n_iter=60, lr=0.01)
+        _add(fn(X_mod_te), fn(X_mod_val))
+        print(f"  {label} C={C}: {time.time()-t1:.1f}s  total={time.time()-t0:.1f}s")
+
 # --- Nystroem RBF kernel + LogReg ---
-# 150 components: ~7s transform + 3×9s LR = 34s total
 if tr() > 90:
     print("Nystroem + LogReg...")
     t1 = time.time()
     ny = Nystroem(kernel='rbf', n_components=150, random_state=0)
-    X_tr_ny = ny.fit_transform(X_tr_s).astype(np.float32)
-    X_te_ny = ny.transform(X_te_s).astype(np.float32)
+    ny.fit(X_tr_oof)
     sc_ny = StandardScaler()
-    X_tr_ny = sc_ny.fit_transform(X_tr_ny).astype(np.float32)
-    X_te_ny = sc_ny.transform(X_te_ny).astype(np.float32)
+    X_tr_ny  = sc_ny.fit_transform(ny.transform(X_tr_oof).astype(np.float32))
+    X_val_ny = sc_ny.transform(ny.transform(X_val_oof).astype(np.float32))
+    X_te_ny  = sc_ny.transform(ny.transform(X_te_s).astype(np.float32))
     print(f"  Nystroem transform: {time.time()-t1:.1f}s")
     for C in [0.1, 0.3, 0.7]:
         if tr() < 12:
             break
         t1 = time.time()
-        fn = vec_logreg(X_tr_ny, ytr_v, C=C, n_iter=40, lr=0.01)
-        pv = fn(X_te_ny)
-        all_preds.append(full_pred(pv)); all_weights.append(0.8)
+        fn = vec_logreg(X_tr_ny, y_tr_oof, C=C, n_iter=40, lr=0.01)
+        _add(fn(X_te_ny), fn(X_val_ny))
         print(f"  Ny+LR C={C}: {time.time()-t1:.1f}s  total={time.time()-t0:.1f}s")
 else:
     print(f"Skipping Nystroem, {tr():.0f}s remain")
 
 # --- Vectorized 2-layer MLP ensemble ---
-# h=64 60iter ≈ 18s; h=128 50iter ≈ 15-32s (variable).
-# Use continue to skip h=128 when budget is tight but keep running h=64 models.
 print("2-layer MLP ensemble...")
 mlp2_configs = [
-    # Wide networks first (most diverse) — skipped if budget tight
-    (0,  256, 35, 0.002, 0.10),
-    (1,  256, 35, 0.002, 0.10),
-    (2,  256, 35, 0.002, 0.10),
-    # h=128 ensemble (balance of capacity + speed)
+    # h=128 first (diverse capacity without h=256 slowness on large features)
     (0,  128, 50, 0.003, 0.10),
     (1,  128, 50, 0.003, 0.10),
     (2,  128, 50, 0.003, 0.10),
     (3,  128, 50, 0.003, 0.10),
+    (4,  128, 50, 0.003, 0.10),
     (0,  128, 50, 0.003, 0.20),
     (1,  128, 50, 0.003, 0.20),
+    (2,  128, 50, 0.003, 0.20),
     # h=64 high-count for variance reduction
     (0,  64,  60, 0.005, 0.10),
     (1,  64,  60, 0.005, 0.10),
@@ -251,39 +274,66 @@ mlp2_configs = [
     (5,  64,  60, 0.005, 0.10),
     (6,  64,  60, 0.005, 0.10),
     (7,  64,  60, 0.005, 0.10),
+    (8,  64,  60, 0.005, 0.10),
+    (9,  64,  60, 0.005, 0.10),
     (0,  64,  60, 0.005, 0.20),
     (1,  64,  60, 0.005, 0.20),
     (2,  64,  60, 0.005, 0.20),
     (3,  64,  60, 0.005, 0.20),
     (4,  64,  60, 0.005, 0.20),
+    (5,  64,  60, 0.005, 0.20),
     (0,  64,  80, 0.003, 0.10),
     (1,  64,  80, 0.003, 0.10),
     (2,  64,  80, 0.003, 0.10),
+    (3,  64,  80, 0.003, 0.10),
 ]
 for seed, hidden, n_iter, lr, C in mlp2_configs:
     remaining = tr()
-    if remaining < 23:
+    if remaining < 25:
         print(f"  Stopping, {remaining:.0f}s remain")
         break
-    if hidden >= 256 and remaining < 65:
-        print(f"  Skipping h={hidden} s={seed} C={C}, {remaining:.0f}s remain")
-        continue
-    if hidden >= 128 and remaining < 42:
-        print(f"  Skipping h={hidden} s={seed} C={C}, {remaining:.0f}s remain")
+    if hidden >= 128 and remaining < 45:
         continue
     t1 = time.time()
     print(f"  2L h={hidden} s={seed} C={C}  t={time.time()-t0:.1f}s ...")
-    fn = vec_2layer(X_tr_s, ytr_v, C=C, hidden=hidden,
+    fn = vec_2layer(X_tr_oof, y_tr_oof, C=C, hidden=hidden,
                     n_iter=n_iter, lr=lr, seed=seed)
-    pv = np.clip(fn(X_te_s), 0.0, 1.0)
-    all_preds.append(full_pred(pv)); all_weights.append(1.0)
+    _add(np.clip(fn(X_te_s), 0, 1), np.clip(fn(X_val_oof), 0, 1))
     print(f"    {time.time()-t1:.1f}s  total={time.time()-t0:.1f}s")
 
-# === Weighted ensemble ===
+# === OOF weight optimization ===
+print(f"OOF weight optimization ({len(all_preds)} models)...")
+val_stack  = np.array(all_val,   dtype=np.float64)   # (n_m, n_test, n_tar)
+test_stack = np.array(all_preds, dtype=np.float64)
+n_m = len(all_preds)
+
+# Build full-tar val targets
+y_val_full = np.zeros((len(X_val_oof), n_tar), dtype=np.float64)
+y_val_full[:, valid_idx] = y_val_oof
+
+# Mean column-wise log loss on val (vectorized)
+def oof_loss(log_w):
+    w = np.exp(log_w - log_w.max())
+    w /= w.sum()
+    blend = np.einsum('m,mjt->jt', w, val_stack)  # (n_val, n_tar)
+    blend = np.clip(blend, 1e-7, 1 - 1e-7)
+    ll = -(y_val_full * np.log(blend) + (1 - y_val_full) * np.log(1 - blend))
+    return ll.mean()
+
+w0   = np.zeros(n_m)
+t_opt = time.time()
+res  = scipy_minimize(oof_loss, w0, method='L-BFGS-B',
+                      options={'maxiter': 500, 'ftol': 1e-9})
+opt_w = np.exp(res.x - res.x.max()); opt_w /= opt_w.sum()
+print(f"  OOF val loss: {res.fun:.6f}  ({time.time()-t_opt:.1f}s)")
+print(f"  Weights: min={opt_w.min():.4f}  max={opt_w.max():.4f}")
+all_weights = opt_w.tolist()
+
+# === Weighted ensemble (OOF-optimized weights) ===
 print(f"Ensembling {len(all_preds)} models...")
 w = np.array(all_weights, dtype=np.float32)
 w /= w.sum()
-ensemble = sum(float(wi) * pi for wi, pi in zip(w, all_preds)).astype(np.float32)
+ensemble = np.einsum('m,mjt->jt', w.astype(np.float64), test_stack).astype(np.float32)
 ensemble = np.clip(ensemble, 1e-6, 1 - 1e-6)
 
 # === Per-target adaptive Bayesian calibration ===
