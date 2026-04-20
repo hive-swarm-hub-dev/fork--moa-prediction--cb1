@@ -57,43 +57,54 @@ def stat_block(arr):
 
 
 def build_features(train_df, test_df):
+    """472-dim features matching cb2's approach:
+    - Transductive PCA: gene(50) + cell(30)
+    - Top-50 raw high-variance gene features
+    - Interactions: gene×time(15) + gene×dose(15) + gene×cell(10) = 40
+    - cp_time, cp_dose = 2
+    - Base total = 172 dims
+    - Nystroem RBF on top-50 PCA subspace (gamma=0.03, 300 components)
+    - Total: 472 dims
+    """
     n_tr = len(train_df)
     tr_g = train_df[gene_cols].values.astype(np.float32)
     te_g = test_df[gene_cols].values.astype(np.float32)
     tr_c = train_df[cell_cols].values.astype(np.float32)
     te_c = test_df[cell_cols].values.astype(np.float32)
-    all_g  = np.vstack([tr_g, te_g])
-    all_c  = np.vstack([tr_c, te_c])
-    all_gc = np.hstack([all_g, all_c])
-    ag  = StandardScaler().fit_transform(all_g)
-    ac  = StandardScaler().fit_transform(all_c)
-    agc = StandardScaler().fit_transform(all_gc)
-    svg  = TruncatedSVD(100, n_iter=4, random_state=0).fit_transform(ag)
-    svc  = TruncatedSVD(50, n_iter=4, random_state=0).fit_transform(ac)
-    svgc = TruncatedSVD(40, n_iter=2, random_state=0).fit_transform(agc)
-    # Cross-PCA: SVD on gene×cell outer products captures interaction manifold
-    n_all = len(all_g)
-    cross_flat = (svg[:, :25, None] * svc[:, None, :20]).reshape(n_all, -1)
-    cross_pca = TruncatedSVD(25, n_iter=2, random_state=0).fit_transform(cross_flat)
+    all_g = np.vstack([tr_g, te_g])
+    all_c = np.vstack([tr_c, te_c])
+    # Transductive PCA: fit on train+test combined
+    ag = StandardScaler().fit_transform(all_g)
+    ac = StandardScaler().fit_transform(all_c)
+    svg = TruncatedSVD(50, n_iter=4, random_state=0).fit_transform(ag)   # 50 gene PCA dims
+    svc = TruncatedSVD(30, n_iter=4, random_state=0).fit_transform(ac)   # 30 cell PCA dims
+    # Top-50 raw high-variance gene features (selected by training variance)
+    gene_var = tr_g.var(axis=0)
+    top50_idx = np.argsort(gene_var)[-50:]
+    raw_gene = np.vstack([tr_g[:, top50_idx], te_g[:, top50_idx]]).astype(np.float32)
+    raw_gene = StandardScaler().fit_transform(raw_gene)
     cp_t = np.concatenate([train_df["cp_t"].values, test_df["cp_t"].values])
     cp_d = np.concatenate([train_df["cp_d"].values, test_df["cp_d"].values])
-    # Nystroem RBF on 50-dim PCA subspace (transductive: fit on train+test combined)
-    # gamma=0.03 calibrated for 50-dim space; higher gamma makes kernel near-zero
+    # Interaction features: gene×time(15) + gene×dose(15) + gene×cell(10) = 40 dims
+    interact = np.hstack([
+        svg[:, :15] * cp_t[:, None],   # gene × time
+        svg[:, :15] * cp_d[:, None],   # gene × dose
+        svg[:, :10] * svc[:, :10],     # gene × cell cross
+    ])
+    # Base features (172 dims) with StandardScaler
+    X_base = np.hstack([svg, svc, raw_gene, interact,
+                        np.column_stack([cp_t, cp_d])]).astype(np.float32)
+    X_base = StandardScaler().fit_transform(X_base)
+    # Nystroem RBF on 50-dim PCA subspace: fit on training data only (inductive)
+    # gamma=0.03 calibrated for 50-dim space (exp(-0.03 * 100) ≈ 0.05, well-behaved)
     X_low = np.hstack([svg[:, :35], svc[:, :15]]).astype(np.float32)
-    X_low = StandardScaler().fit_transform(X_low)
+    low_sc = StandardScaler()
+    X_low_tr = low_sc.fit_transform(X_low[:n_tr])
+    X_low_all = np.vstack([X_low_tr, low_sc.transform(X_low[n_tr:])])
     nys = Nystroem(kernel='rbf', n_components=300, gamma=0.03, random_state=42)
-    nys.fit(X_low)
-    X_nys = nys.transform(X_low).astype(np.float32)
-    X = np.hstack([
-        svg, svc, svgc,
-        svg[:, :25] * cp_t[:, None], svg[:, :25] * cp_d[:, None],
-        svc[:, :12] * cp_t[:, None], svc[:, :12] * cp_d[:, None],
-        svg[:, :10] * svc[:, :10],
-        cross_pca,
-        stat_block(all_g), stat_block(all_c),
-        np.column_stack([cp_t, cp_d, cp_t * cp_d, cp_t ** 2]),
-        X_nys,  # 300 Nystroem RBF features (cols 315:615)
-    ]).astype(np.float32)
+    nys.fit(X_low_tr)  # fit on training data only (like cb2)
+    X_nys = nys.transform(X_low_all).astype(np.float32)
+    X = np.hstack([X_base, X_nys]).astype(np.float32)   # 172 + 300 = 472 dims
     return X[:n_tr], X[n_tr:]
 
 
@@ -231,9 +242,9 @@ for C in [0.03, 0.05, 0.07, 0.10, 0.13, 0.18, 0.25]:
     print(f"  C={C} n={n_it}: {time.time()-t1:.1f}s  total={time.time()-t0:.1f}s")
 
 # --- Modality-specific LogReg (gene-only and cell-only SVD features) ---
-# svg components = cols 0:100, svc components = cols 100:150
+# svg components = cols 0:50, svc components = cols 50:80
 print("Modality LogReg...")
-for feat_start, feat_end, label in [(0, 100, "gene"), (100, 150, "cell")]:
+for feat_start, feat_end, label in [(0, 50, "gene"), (50, 80, "cell")]:
     X_mod     = X_tr_oof[:, feat_start:feat_end]
     X_mod_val = X_val_oof[:, feat_start:feat_end]
     X_mod_te  = X_te_s[:, feat_start:feat_end]
@@ -248,12 +259,12 @@ for feat_start, feat_end, label in [(0, 100, "gene"), (100, 150, "cell")]:
 
 
 # --- Modality-specific MLPs (gene-only / cell-only, fast) ---
-# svg=cols 0:100, svc=cols 100:150; these are fast because input dim << 315
+# svg=cols 0:50, svc=cols 50:80; fast because input dim << 472
 if tr() > 20:
     print("Modality MLPs...")
     for feat_slice, label in [
-        (slice(0, 100),  "gene"),
-        (slice(100, 150), "cell"),
+        (slice(0, 50),  "gene"),
+        (slice(50, 80), "cell"),
     ]:
         for seed in range(3):
             if tr() < 10:
